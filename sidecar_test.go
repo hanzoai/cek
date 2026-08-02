@@ -1,8 +1,9 @@
 package cek
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,6 +11,29 @@ import (
 	"github.com/hanzoai/namespace"
 	sqlitedrv "github.com/hanzoai/sqlite"
 )
+
+// wrapForTest seals a DEK the way the original scheme did. It lives in the test
+// because cek only ever READS a sidecar — production mints none, so a wrap in
+// the package itself would be a capability nothing needs. The golden vectors in
+// sidecar_golden_test.go are what prove this agrees with the original; this only
+// has to build fixtures.
+func wrapForTest(t *testing.T, kek, dek, aad []byte) []byte {
+	t.Helper()
+	block, err := aes.NewCipher(kek)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	out := append([]byte{wrapVersion}, nonce...)
+	return gcm.Seal(out, nonce, dek, append([]byte{wrapVersion}, aad...))
+}
 
 // writeWrappedDEKStore builds a database exactly the way the wrapped-DEK scheme
 // did: a DEK from crypto/rand, wrapped under a key derived from the owner and a
@@ -32,23 +56,17 @@ func writeWrappedDEKStore(t *testing.T, master []byte, ns namespace.Namespace, s
 	if _, err := rand.Read(fileID); err != nil {
 		t.Fatalf("file id: %v", err)
 	}
-	dek, err := sqlitedrv.NewDEK()
-	if err != nil {
-		t.Fatalf("NewDEK: %v", err)
+	dek := make([]byte, dekLen)
+	if _, err := rand.Read(dek); err != nil {
+		t.Fatalf("dek: %v", err)
 	}
 
-	ptype, id := sqlitedrv.PrincipalOrg, ns.ID()+"/"+hex.EncodeToString(fileID)
-	if ns.Kind() == namespace.KindSystem {
-		ptype, id = sqlitedrv.PrincipalGlobal, hex.EncodeToString(fileID)
-	}
-	kek, err := sqlitedrv.DeriveKey(master, ptype, id)
+	ptype, id := wrapIdentity(ns, fileID)
+	kek, err := wrapKey(master, ptype, id)
 	if err != nil {
-		t.Fatalf("DeriveKey: %v", err)
+		t.Fatalf("wrapKey: %v", err)
 	}
-	wrapped, err := sqlitedrv.WrapDEK(kek, dek, sqlitedrv.PrincipalAAD(ptype, id))
-	if err != nil {
-		t.Fatalf("WrapDEK: %v", err)
-	}
+	wrapped := wrapForTest(t, kek, dek, principalInfo(ptype, id))
 	if err := os.WriteFile(path+sidecarSuffix, append(append([]byte{}, fileID...), wrapped...), 0o600); err != nil {
 		t.Fatalf("write sidecar: %v", err)
 	}
