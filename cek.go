@@ -2,7 +2,8 @@
 //
 // There is one way to do it:
 //
-//	db, err := cek.Open(master, ns, "treasury", dataDir)
+//	cek.SetMaster(k)                          // once, at boot, from KMS
+//	db, err := cek.Open(ns, "treasury", dir)   // everywhere else
 //
 // The key is derived from the master and the namespace. It is not generated,
 // not wrapped, not stored, and not rotated in place — so there is no unwrap
@@ -10,6 +11,10 @@
 // path to maintain. A database is born encrypted or it does not exist. Losing
 // the master loses the data, which is the property you want from encryption at
 // rest and the reason the master lives in KMS.
+//
+// The master is process state because that is what it is: one key, injected at
+// boot, for every database this process opens. Threading it through every
+// caller would not make it less global, only harder to see.
 //
 // The split of responsibilities is deliberate:
 //
@@ -23,39 +28,82 @@
 package cek
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/hanzoai/namespace"
 	sqlitedrv "github.com/hanzoai/sqlite"
 	"golang.org/x/crypto/hkdf"
 )
 
-// KeyLen is the length of both the master key and every derived key.
+// KeyLen is the length of the master key and of every key derived from it.
 const KeyLen = 32
 
-// info binds a derived key to this scheme, this namespace and this subsystem.
-// Changing any part of it changes every key, which is why the version is in
-// it: a future scheme is a new prefix, not a silent reinterpretation of the
+// infoPrefix binds a derived key to this scheme. The version is part of it so
+// a future scheme is a new prefix rather than a silent reinterpretation of the
 // same bytes.
 const infoPrefix = "hanzo/cek/v1/"
 
-// ErrNoMaster reports a master key that is missing or the wrong length. It is
-// deliberately fatal to Open rather than falling back to plaintext: a service
-// that starts unencrypted because a key was absent has failed silently at the
-// only job this package has.
-var ErrNoMaster = errors.New("cek: master key must be " + itoa(KeyLen) + " bytes")
+// ErrNoMaster reports that no master key has been set, or that one of the
+// wrong length was offered.
+//
+// Open fails with it rather than falling back to an unencrypted file: a
+// service that comes up in plaintext because a key was missing has failed
+// silently at the only thing this package does.
+var ErrNoMaster = errors.New("cek: no master key; call SetMaster with 32 bytes from KMS")
+
+var (
+	masterMu sync.RWMutex
+	master   []byte
+)
+
+// SetMaster installs the master key every database of this process is keyed
+// from. Call it once at boot, before the first Open, with the key resolved
+// from KMS.
+func SetMaster(k []byte) error {
+	if len(k) != KeyLen {
+		return ErrNoMaster
+	}
+	masterMu.Lock()
+	defer masterMu.Unlock()
+	master = append([]byte(nil), k...)
+	return nil
+}
+
+// SetDevMaster installs a random master for a process with no KMS — tests, and
+// a laptop. It reports the key it generated so a caller can log that this is
+// what happened. Nothing it writes survives the process, by construction: a
+// new random master cannot open the previous run's files.
+func SetDevMaster() ([]byte, error) {
+	k := make([]byte, KeyLen)
+	if _, err := rand.Read(k); err != nil {
+		return nil, fmt.Errorf("cek: generate dev master: %w", err)
+	}
+	if err := SetMaster(k); err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// HasMaster reports whether a master key has been installed.
+func HasMaster() bool {
+	masterMu.RLock()
+	defer masterMu.RUnlock()
+	return len(master) == KeyLen
+}
 
 // DeriveKey returns the key for one database: the master, bound to the
 // namespace that owns it and the subsystem it holds.
 //
-// It is a pure function of its inputs. The same namespace and subsystem always
-// produce the same key, so a file can be opened again after a restart with
-// nothing persisted alongside it, and two different databases never share a
-// key because the subsystem is part of the binding.
+// It is a pure function of its inputs, so the same namespace and subsystem
+// always produce the same key. A file therefore reopens after a restart with
+// nothing persisted beside it, and two databases never share a key because the
+// subsystem is part of the binding.
 func DeriveKey(master []byte, ns namespace.Namespace, subsystem string) ([]byte, error) {
 	if len(master) != KeyLen {
 		return nil, ErrNoMaster
@@ -79,9 +127,16 @@ func DeriveKey(master []byte, ns namespace.Namespace, subsystem string) ([]byte,
 // creating it if it does not exist. The returned handle is already keyed;
 // callers use it as an ordinary *sql.DB.
 //
-// The error never contains the key or a DSN that holds it.
-func Open(master []byte, ns namespace.Namespace, subsystem, dir string) (*sql.DB, error) {
-	key, err := DeriveKey(master, ns, subsystem)
+// The location comes from namespace, so a file and its durable slot are two
+// renderings of one name and cannot drift apart.
+//
+// No error returned here contains the key or a DSN holding it.
+func Open(ns namespace.Namespace, subsystem, dir string) (*sql.DB, error) {
+	masterMu.RLock()
+	m := master
+	masterMu.RUnlock()
+
+	key, err := DeriveKey(m, ns, subsystem)
 	if err != nil {
 		return nil, err
 	}
@@ -96,19 +151,4 @@ func Open(master []byte, ns namespace.Namespace, subsystem, dir string) (*sql.DB
 		return nil, fmt.Errorf("cek: open %s database for %s: %w", subsystem, ns, err)
 	}
 	return db, nil
-}
-
-// itoa avoids importing strconv for one constant in an error string.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	var b [4]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }

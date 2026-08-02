@@ -2,13 +2,14 @@ package cek
 
 import (
 	"bytes"
+	"errors"
 	"path/filepath"
 	"testing"
 
 	"github.com/hanzoai/namespace"
 )
 
-func master(b byte) []byte { return bytes.Repeat([]byte{b}, KeyLen) }
+func mk(b byte) []byte { return bytes.Repeat([]byte{b}, KeyLen) }
 
 func mustNS(t *testing.T, org, project string) namespace.Namespace {
 	t.Helper()
@@ -23,11 +24,11 @@ func mustNS(t *testing.T, org, project string) namespace.Namespace {
 // reopened after a restart.
 func TestDeriveIsDeterministic(t *testing.T) {
 	ns := mustNS(t, "acme", "")
-	a, err := DeriveKey(master(1), ns, "treasury")
+	a, err := DeriveKey(mk(1), ns, "treasury")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := DeriveKey(master(1), ns, "treasury")
+	b, _ := DeriveKey(mk(1), ns, "treasury")
 	if !bytes.Equal(a, b) {
 		t.Fatal("same inputs produced different keys")
 	}
@@ -39,17 +40,17 @@ func TestDeriveIsDeterministic(t *testing.T) {
 // Every axis must change the key. If any of these collide, two databases share
 // a key and one account's file opens another's.
 func TestDeriveSeparatesEveryAxis(t *testing.T) {
-	base, _ := DeriveKey(master(1), mustNS(t, "acme", ""), "treasury")
+	base, _ := DeriveKey(mk(1), mustNS(t, "acme", ""), "treasury")
 
 	for _, tc := range []struct {
 		name string
 		key  func() ([]byte, error)
 	}{
-		{"different master", func() ([]byte, error) { return DeriveKey(master(2), mustNS(t, "acme", ""), "treasury") }},
-		{"different org", func() ([]byte, error) { return DeriveKey(master(1), mustNS(t, "globex", ""), "treasury") }},
-		{"different subsystem", func() ([]byte, error) { return DeriveKey(master(1), mustNS(t, "acme", ""), "audit") }},
-		{"a project of that org", func() ([]byte, error) { return DeriveKey(master(1), mustNS(t, "acme", "web"), "treasury") }},
-		{"the system namespace", func() ([]byte, error) { return DeriveKey(master(1), namespace.System(), "treasury") }},
+		{"different master", func() ([]byte, error) { return DeriveKey(mk(2), mustNS(t, "acme", ""), "treasury") }},
+		{"different org", func() ([]byte, error) { return DeriveKey(mk(1), mustNS(t, "globex", ""), "treasury") }},
+		{"different subsystem", func() ([]byte, error) { return DeriveKey(mk(1), mustNS(t, "acme", ""), "audit") }},
+		{"a project of that org", func() ([]byte, error) { return DeriveKey(mk(1), mustNS(t, "acme", "web"), "treasury") }},
+		{"the system namespace", func() ([]byte, error) { return DeriveKey(mk(1), namespace.System(), "treasury") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.key()
@@ -74,8 +75,8 @@ func TestDeriveRefusesBadInput(t *testing.T) {
 	}{
 		{"no master", nil, ns, "treasury"},
 		{"short master", bytes.Repeat([]byte{1}, 16), ns, "treasury"},
-		{"zero namespace", master(1), namespace.Namespace{}, "treasury"},
-		{"empty subsystem", master(1), ns, ""},
+		{"zero namespace", mk(1), namespace.Namespace{}, "treasury"},
+		{"empty subsystem", mk(1), ns, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := DeriveKey(tc.master, tc.ns, tc.sub); err == nil {
@@ -89,8 +90,11 @@ func TestDeriveRefusesBadInput(t *testing.T) {
 func TestOpenUsesTheNamespaceLocation(t *testing.T) {
 	dir := t.TempDir()
 	ns := mustNS(t, "acme", "")
+	if err := SetMaster(mk(1)); err != nil {
+		t.Fatal(err)
+	}
 
-	db, err := Open(master(1), ns, "treasury", dir)
+	db, err := Open(ns, "treasury", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,11 +114,46 @@ func TestOpenUsesTheNamespaceLocation(t *testing.T) {
 
 // An error must never carry the key or a DSN holding it.
 func TestOpenErrorHoldsNoKey(t *testing.T) {
-	_, err := Open(master(1), namespace.Namespace{}, "treasury", t.TempDir())
+	if err := SetMaster(mk(1)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Open(namespace.Namespace{}, "treasury", t.TempDir())
 	if err == nil {
 		t.Fatal("expected an error")
 	}
-	if bytes.Contains([]byte(err.Error()), master(1)) {
+	if bytes.Contains([]byte(err.Error()), mk(1)) {
 		t.Fatal("error leaked the key")
 	}
 }
+
+// Open must refuse rather than write an unencrypted file when no key is set.
+func TestOpenRefusesWithoutAMaster(t *testing.T) {
+	masterMu.Lock()
+	master = nil
+	masterMu.Unlock()
+
+	if HasMaster() {
+		t.Fatal("master should be unset")
+	}
+	if _, err := Open(mustNS(t, "acme", ""), "treasury", t.TempDir()); !errorIs(err, ErrNoMaster) {
+		t.Fatalf("got %v, want ErrNoMaster — a missing key must never open plaintext", err)
+	}
+}
+
+// A dev master must actually key the database, not skip encryption.
+func TestDevMasterKeys(t *testing.T) {
+	k, err := SetDevMaster()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(k) != KeyLen || !HasMaster() {
+		t.Fatal("dev master not installed")
+	}
+	db, err := Open(mustNS(t, "acme", ""), "treasury", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+}
+
+func errorIs(err, target error) bool { return err != nil && errors.Is(err, target) }

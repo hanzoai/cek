@@ -3,7 +3,8 @@
 Opens a namespace's SQLite database encrypted at rest.
 
 ```go
-db, err := cek.Open(master, ns, "treasury", dataDir)
+cek.SetMaster(k)                            // once, at boot, from KMS
+db, err := cek.Open(ns, "treasury", dataDir) // everywhere else
 ```
 
 The key is derived from the master and the namespace. It is not generated, not
