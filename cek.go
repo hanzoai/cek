@@ -157,6 +157,16 @@ func Open(ns namespace.Namespace, subsystem, dir string) (*sql.DB, error) {
 		return nil, fmt.Errorf("cek: create directory for %s database: %w", subsystem, err)
 	}
 
+	// A database written by the wrapped-DEK scheme has its key beside it, and no
+	// derivation reproduces that key — it came from crypto/rand. The sidecar's
+	// presence is what says which scheme a file belongs to. See sidecar.go.
+	if dek, err := sidecarKey(m, ns, path); err != nil {
+		return nil, err
+	} else if dek != nil {
+		defer zero(dek)
+		key = dek
+	}
+
 	db, err := sqlitedrv.OpenDB(path, key)
 	if err != nil {
 		return nil, fmt.Errorf("cek: open %s database for %s: %w", subsystem, ns, err)
