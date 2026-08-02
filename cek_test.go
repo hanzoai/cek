@@ -157,3 +157,37 @@ func TestDevMasterKeys(t *testing.T) {
 }
 
 func errorIs(err, target error) bool { return err != nil && errors.Is(err, target) }
+
+// Open picks the path, so Open must make it exist. When it did not, the open
+// succeeded and Close failed with "envelope seal: no such file or directory" —
+// the caller was handed a database and lost every write in it.
+func TestOpenCreatesItsDirectoryAndSurvivesClose(t *testing.T) {
+	if _, err := SetDevMaster(); err != nil {
+		t.Fatal(err)
+	}
+	// A dir that exists but has none of the namespace subdirectories under it.
+	dir := t.TempDir()
+	ns := mustNS(t, "acme", "web")
+
+	db, err := Open(ns, "treasury", dir)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE t (v TEXT)`); err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v — writes were lost", err)
+	}
+
+	// It must reopen and still have the table: proof the bytes reached disk.
+	db2, err := Open(ns, "treasury", dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	var n int
+	if err := db2.QueryRow(`SELECT count(*) FROM t`).Scan(&n); err != nil {
+		t.Fatalf("the table did not survive: %v", err)
+	}
+}

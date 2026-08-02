@@ -34,6 +34,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/hanzoai/namespace"
@@ -144,6 +146,15 @@ func Open(ns namespace.Namespace, subsystem, dir string) (*sql.DB, error) {
 	path, err := namespace.Path(dir, ns, subsystem)
 	if err != nil {
 		return nil, err
+	}
+
+	// Create the directory, because this function chose the path. Without it
+	// the open SUCCEEDS and the failure surfaces at Close, as "envelope seal:
+	// no such file or directory" — every write of that session is lost, after
+	// the caller has been told it had a database. A function that picks where a
+	// file goes has to make that place exist.
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("cek: create directory for %s database: %w", subsystem, err)
 	}
 
 	db, err := sqlitedrv.OpenDB(path, key)
