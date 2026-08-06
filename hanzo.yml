@@ -1,0 +1,12 @@
+# Canonical CI/CD config for hanzoai/cek — read by the hanzoai/ci reusable
+# (.hanzo/workflows/cicd.yml) and by platform.hanzo.ai.
+#
+# A Go library: it ships from a tag as a module, builds no image, so there is no
+# `images:` and no `deploy:`. The gate is the two things that can actually be
+# wrong — the library does not compile, or its tests fail.
+
+test:
+  - name: build
+    run: go build ./...
+  - name: test
+    run: go test -count=1 ./...
