@@ -134,15 +134,6 @@ func DeriveKey(master []byte, ns namespace.Namespace, subsystem string) ([]byte,
 //
 // No error returned here contains the key or a DSN holding it.
 func Open(ns namespace.Namespace, subsystem, dir string) (*sql.DB, error) {
-	masterMu.RLock()
-	m := master
-	masterMu.RUnlock()
-
-	key, err := DeriveKey(m, ns, subsystem)
-	if err != nil {
-		return nil, err
-	}
-
 	path, err := namespace.Path(dir, ns, subsystem)
 	if err != nil {
 		return nil, err
@@ -156,6 +147,31 @@ func Open(ns namespace.Namespace, subsystem, dir string) (*sql.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("cek: create directory for %s database: %w", subsystem, err)
 	}
+	return OpenAt(ns, subsystem, path)
+}
+
+// OpenAt opens the encrypted database at path, under the key ns and subsystem
+// derive. It is Open for a store whose LOCATION is settled by something other
+// than the namespace — a mounted volume that an operator points at a fixed
+// place, say, where the file cannot move to suit a naming scheme.
+//
+// Open is this function over namespace.Path, so there is one derivation and one
+// keyed open, and a store that names its own path gets exactly the encryption
+// every other store gets.
+//
+// The caller owns the path, and with it the one thing namespace was protecting:
+// two different files opened under the same (ns, subsystem) share a key. Give a
+// store its own subsystem and that cannot arise.
+func OpenAt(ns namespace.Namespace, subsystem, path string) (*sql.DB, error) {
+	masterMu.RLock()
+	m := master
+	masterMu.RUnlock()
+
+	key, err := DeriveKey(m, ns, subsystem)
+	if err != nil {
+		return nil, err
+	}
+	defer zero(key)
 
 	// A database written by the wrapped-DEK scheme has its key beside it, and no
 	// derivation reproduces that key — it came from crypto/rand. The sidecar's
