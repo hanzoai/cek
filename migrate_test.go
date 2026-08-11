@@ -334,8 +334,9 @@ func TestInterruptedSwapIsFinished(t *testing.T) {
 		t.Fatalf("stage bak: %v", err)
 	}
 
-	if err := recoverInterrupted(path); err != nil {
-		t.Fatalf("recoverInterrupted: %v", err)
+	// Convert is what a boot calls: it recovers, then settles.
+	if err := Convert(namespace.System(), "iam", path); err != nil {
+		t.Fatalf("Convert after an interrupted swap: %v", err)
 	}
 	if !fileExists(path) {
 		t.Fatal("the swap was not finished")
@@ -344,7 +345,7 @@ func TestInterruptedSwapIsFinished(t *testing.T) {
 		t.Error("the temporary copy is still there")
 	}
 	if fileExists(path + plainBakSuffix) {
-		t.Error("the plaintext backup was not shredded")
+		t.Error("the plaintext backup was not shredded after the store proved readable")
 	}
 
 	db, err := OpenAt(namespace.System(), "iam", path)
@@ -381,5 +382,75 @@ func TestUncommittedSwapIsRolledBack(t *testing.T) {
 	}
 	if fileExists(path + plainBakSuffix) {
 		t.Error("the backup is still there after being restored")
+	}
+}
+
+// The backup is released by a PROOF, never by an absence of evidence.
+//
+// These pin the failure the shredding used to key on: "this file does not have a
+// plaintext SQLite header" was read as "it is the encrypted store, so the copy
+// beside it can go". An empty file, a truncated one and a database under another
+// master all answer that question the same way, and every one of them would have
+// destroyed the last readable identity graph while returning success.
+
+func TestATruncatedStoreIsRefusedAndKeepsItsBackup(t *testing.T) {
+	setTestMaster(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iam.db")
+
+	// The shape an unclean stop leaves behind: a zero-length file where the
+	// database was, with the pre-migration plaintext still beside it.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("stage empty: %v", err)
+	}
+	seedPlaintext(t, path+plainBakSuffix)
+
+	if err := Convert(namespace.System(), "iam", path); err == nil {
+		t.Fatal("Convert accepted a zero-length store instead of refusing it")
+	}
+	if !fileExists(path + plainBakSuffix) {
+		t.Fatal("the plaintext backup was shredded for a store that was never opened")
+	}
+}
+
+func TestAStoreUnderAnotherMasterKeepsItsBackup(t *testing.T) {
+	requireCodec(t)
+	setTestMaster(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "iam.db")
+
+	// Encrypted, and NOT under the key this process derives.
+	other := make([]byte, KeyLen)
+	for i := range other {
+		other[i] = byte(255 - i)
+	}
+	db, err := openKeyed(path, other)
+	if err != nil {
+		t.Fatalf("seed a store under another key: %v", err)
+	}
+	if _, err := db.Exec(`CREATE TABLE t (v TEXT)`); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = db.Close()
+	seedPlaintext(t, path+plainBakSuffix)
+
+	if err := Convert(namespace.System(), "iam", path); err == nil {
+		t.Fatal("Convert reported success for a store it cannot read")
+	}
+	if !fileExists(path + plainBakSuffix) {
+		t.Fatal("the plaintext backup was shredded for a store that does not open under this master")
+	}
+}
+
+func TestConvertDoesNotCreateAStoreThatIsNotThere(t *testing.T) {
+	setTestMaster(t)
+	path := filepath.Join(t.TempDir(), "iam.db")
+	if err := Convert(namespace.System(), "iam", path); err != nil {
+		t.Fatalf("Convert on an absent store: %v", err)
+	}
+	if fileExists(path) {
+		t.Fatal("Convert created a store, which is how an empty identity service gets served")
 	}
 }

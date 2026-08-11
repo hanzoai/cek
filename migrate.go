@@ -20,6 +20,11 @@ import (
 	sqlitedrv "github.com/hanzoai/sqlite"
 )
 
+// hexKey renders a raw key in the x'…' form SQLCipher reads as key material
+// rather than as a passphrase to stretch. Bound as a parameter, never formatted
+// into a statement.
+func hexKey(key []byte) string { return fmt.Sprintf("x'%x'", key) }
+
 // openPlain opens a database with NO key, which is what a file written before
 // cek is. It exists so the one place that reads plaintext says so out loud.
 func openPlain(path string) (*sql.DB, error) {
@@ -110,13 +115,56 @@ func Convert(ns namespace.Namespace, subsystem, path string) error {
 	if err := recoverInterrupted(path); err != nil {
 		return err
 	}
-	if !isPlaintext(path) {
-		// Already encrypted, or not there at all. Either way this has nothing to
-		// do, and saying so costs one stat.
-		shredPlainBak(path)
+
+	switch classify(path) {
+	case absent:
+		// Nothing to convert. Open will create one born encrypted, and this must
+		// not create it here — a file made by the converter is a file with no
+		// identities in it.
 		return nil
+	case plaintext:
+		return convert(path, key)
+	case truncated:
+		// Too small to be a database. This is NOT "already encrypted": a store is
+		// never two bytes long, and reading it as done is how a delayed
+		// allocation after an unclean stop becomes a shredded backup and an empty
+		// identity service. Refuse and let recoverInterrupted's backup, or a
+		// human, settle it.
+		return fmt.Errorf("cek: %q is too small to be a database, so this refuses to treat it as one", path)
+	default:
+		// Encrypted already — or something this cannot read. Which of those it is
+		// decides whether the plaintext beside it may go, so ASK the file.
+		return settle(path, key)
 	}
-	return convert(path, key)
+}
+
+// settle proves the store at path opens and decrypts under key, and only then
+// releases the plaintext copy a commit left beside it.
+//
+// The proof is the whole function. "Not a plaintext SQLite header" is not proof
+// of anything — an empty file, a truncated one, and a database encrypted under a
+// DIFFERENT master all look identical through that lens, and every one of them
+// would otherwise shred the last readable copy of the identity graph while
+// reporting success.
+func settle(path string, key []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), convertTimeout)
+	defer cancel()
+
+	db, err := openKeyed(path, key)
+	if err != nil {
+		return fmt.Errorf("cek: open %q: %w", path, err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Reading the schema is what forces SQLCipher to take the key to the pages.
+	// Opening a handle proves nothing: database/sql connects lazily, so a wrong
+	// key surfaces at the first read and not before.
+	var n int64
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master").Scan(&n); err != nil {
+		return fmt.Errorf("cek: %q does not read under its key (wrong master key, or a damaged store): %w", path, err)
+	}
+	shredPlainBak(path)
+	return nil
 }
 
 // convert holds the whole of the one-way trip, with the lock already held and
@@ -130,9 +178,9 @@ func convert(path string, key []byte) error {
 		removeDBFiles(tmp)
 		return err
 	}
-	if isPlaintext(tmp) {
+	if classify(tmp) != sealed {
 		removeDBFiles(tmp)
-		return fmt.Errorf("cek: converting %q produced a plaintext file — this build has no SQLCipher codec, so it cannot encrypt anything", path)
+		return fmt.Errorf("cek: converting %q did not produce an encrypted file — this build has no SQLCipher codec, so it cannot encrypt anything", path)
 	}
 	if err := verify(tmp, key, srcInv); err != nil {
 		removeDBFiles(tmp)
@@ -140,13 +188,27 @@ func convert(path string, key []byte) error {
 	}
 
 	// Only the main file is renamed below, so the copy has to be COMPLETE in it.
-	// Closing the last connection checkpoints and removes a WAL, so one still
-	// here means the copy was left open or the close did not finish — and
-	// renaming the main file alone would drop whatever the WAL still holds.
+	// Closing the last connection checkpoints and removes a WAL or a rollback
+	// journal, so one still here means the close did not finish — and renaming
+	// the main file alone would drop whatever that file still holds. The journal
+	// is the one that actually turns up: the attached target runs in DELETE mode,
+	// because journal_mode applies to main and not to what ATTACH opens.
 	// Refusing costs a retry on the next boot; renaming anyway costs the rows.
-	if fileExists(tmp + "-wal") {
+	for _, sidefile := range []string{"-wal", "-journal"} {
+		if fileExists(tmp + sidefile) {
+			removeDBFiles(tmp)
+			return fmt.Errorf("cek: the encrypted copy of %q still has a %s file beside it, so it is not complete in one file; the original is untouched", path, sidefile)
+		}
+	}
+
+	// Get the copy's BYTES to the disk before the plaintext stops being the
+	// source of truth. syncDir below makes the RENAME durable, which is a
+	// different promise: without this the encrypted pages can still be in the
+	// page cache when the original is released, and a power loss inside the
+	// writeback window leaves a torn database and no plaintext to rebuild it.
+	if err := syncFile(tmp); err != nil {
 		removeDBFiles(tmp)
-		return fmt.Errorf("cek: the encrypted copy of %q still has a write-ahead log, so it is not complete in one file; the original is untouched", path)
+		return fmt.Errorf("cek: flush the encrypted copy of %q to disk: %w", path, err)
 	}
 
 	// Commit, in the order a crash can be read back from:
@@ -201,19 +263,29 @@ func export(path, tmp string, key []byte) (inventory, error) {
 
 	// A live store carries megabytes of WAL. Fold it in first, so the copy and
 	// the backup both hold every committed row.
-	if _, err := conn.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+	//
+	// The RESULT has to be read, not just the error. wal_checkpoint reports a
+	// refusal in its first column and still returns success, so an unchecked call
+	// is indistinguishable from one that did nothing — and the plaintext -wal is
+	// deleted a few lines later, on the strength of this having worked.
+	var busy, logFrames, checkpointed int64
+	if err := conn.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointed); err != nil {
 		return inventory{}, fmt.Errorf("cek: checkpoint %q: %w", path, err)
+	}
+	if busy != 0 {
+		return inventory{}, fmt.Errorf("cek: %q has a write-ahead log this could not fold in — something else is holding the database open, and converting it now would strand those rows", path)
 	}
 	srcInv, err := readInventory(ctx, conn)
 	if err != nil {
 		return inventory{}, fmt.Errorf("cek: read what %q holds: %w", path, err)
 	}
 
-	// The key is crypto/rand-derived hex, so it carries no injection surface; the
-	// path is a bound parameter. The reopen in convert is what actually settles
-	// that the copy is readable under the application's own keyed open.
-	attach := fmt.Sprintf(`ATTACH DATABASE ? AS enc KEY "x'%x'"`, key)
-	if _, err := conn.ExecContext(ctx, attach, tmp); err != nil {
+	// BOTH the path and the key are bound, so neither reaches SQLite as text. The
+	// key especially: written into the statement, a parse error quotes the
+	// statement back — and SQLite's error would then carry the whole key into a
+	// log the moment a build turns off the double-quoted-string fallback that
+	// currently makes `KEY "x'...'"` parse at all.
+	if _, err := conn.ExecContext(ctx, `ATTACH DATABASE ? AS enc KEY ?`, tmp, hexKey(key)); err != nil {
 		return inventory{}, fmt.Errorf("cek: attach the encrypted target: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "SELECT sqlcipher_export('enc')"); err != nil {
@@ -486,13 +558,12 @@ func addInto(acc *[32]byte, row [32]byte) {
 func recoverInterrupted(path string) error {
 	tmp := path + tmpSuffix
 	if fileExists(path) {
-		// The live file is there. If it is already encrypted then a leftover tmp
-		// is a dead attempt and the backup has served its purpose; a plaintext
-		// live file is a conversion that never committed, and convert clears tmp
-		// itself before it starts again.
-		if !isPlaintext(path) {
+		// The live file is there, so nothing is mid-swap. A leftover tmp is a dead
+		// attempt either way. The BACKUP is deliberately left alone: whether it may
+		// go depends on the live file opening under its key, which is settle's
+		// question and not one that can be answered from the file names.
+		if classify(path) != plaintext {
 			removeDBFiles(tmp)
-			shredPlainBak(path)
 		}
 		return nil
 	}
@@ -506,7 +577,7 @@ func recoverInterrupted(path string) error {
 		_ = os.Remove(path + "-wal")
 		_ = os.Remove(path + "-shm")
 		syncDir(filepath.Dir(path))
-		shredPlainBak(path)
+		// The backup stays until settle has opened what is now in place.
 	case fileExists(path + plainBakSuffix):
 		// The swap never happened. Put the plaintext back and let it be redone.
 		if err := os.Rename(path+plainBakSuffix, path); err != nil {
@@ -517,20 +588,40 @@ func recoverInterrupted(path string) error {
 	return nil
 }
 
-// isPlaintext reports whether path is an UNENCRYPTED SQLite database — the one
-// question that decides whether there is anything to convert. An absent or
-// too-small file is not one.
-func isPlaintext(path string) bool {
+// state is what a file at a path IS, and it has four answers rather than two on
+// purpose. A boolean "is this plaintext" folds absent, empty, truncated and
+// encrypted into one false, and a caller that reads that false as "already
+// encrypted, my work here is done" will delete the backup for three of them.
+type state int
+
+const (
+	absent    state = iota // nothing there
+	truncated              // there, but too small to be a database
+	plaintext              // an UNENCRYPTED SQLite database
+	sealed                 // something else: encrypted, or unreadable
+)
+
+func classify(path string) state {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return absent
+	}
+	if fi.Size() < headerLen {
+		return truncated
+	}
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return sealed
 	}
 	defer func() { _ = f.Close() }()
 	var hdr [headerLen]byte
 	if _, err := f.ReadAt(hdr[:], 0); err != nil {
-		return false
+		return sealed
 	}
-	return string(hdr[:]) == sqliteMagic
+	if string(hdr[:]) == sqliteMagic {
+		return plaintext
+	}
+	return sealed
 }
 
 // shredPlainBak overwrites and removes the transient plaintext left by a commit.
@@ -574,11 +665,28 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// removeDBFiles removes a database and the two files SQLite keeps beside it.
+// removeDBFiles removes a database and every file SQLite keeps beside it. The
+// rollback journal belongs in this list: an ATTACHed target journals in DELETE
+// mode, so a crash mid-export leaves one, and clearing the database without it
+// would leave a hot journal beside the NEXT attempt's fresh file.
 func removeDBFiles(base string) {
-	for _, s := range []string{"", "-wal", "-shm"} {
+	for _, s := range []string{"", "-wal", "-shm", "-journal"} {
 		_ = os.Remove(base + s)
 	}
+}
+
+// syncFile forces a file's contents to the disk. A rename is only as durable as
+// what it points at.
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // syncDir fsyncs a directory so a rename is durable. Best effort: a filesystem
