@@ -139,6 +139,16 @@ func convert(path string, key []byte) error {
 		return fmt.Errorf("cek: the encrypted copy of %q does not match it, so the original is untouched: %w", path, err)
 	}
 
+	// Only the main file is renamed below, so the copy has to be COMPLETE in it.
+	// Closing the last connection checkpoints and removes a WAL, so one still
+	// here means the copy was left open or the close did not finish — and
+	// renaming the main file alone would drop whatever the WAL still holds.
+	// Refusing costs a retry on the next boot; renaming anyway costs the rows.
+	if fileExists(tmp + "-wal") {
+		removeDBFiles(tmp)
+		return fmt.Errorf("cek: the encrypted copy of %q still has a write-ahead log, so it is not complete in one file; the original is untouched", path)
+	}
+
 	// Commit, in the order a crash can be read back from:
 	//  1. plaintext → <db>.plain.bak, so the original still exists,
 	//  2. drop the orphaned plaintext -wal/-shm (the WAL was folded into the main
@@ -210,6 +220,17 @@ func export(path, tmp string, key []byte) (inventory, error) {
 		_, _ = conn.ExecContext(ctx, "DETACH DATABASE enc")
 		return inventory{}, fmt.Errorf("cek: copy %q into the encrypted target: %w", path, err)
 	}
+	// sqlcipher_export copies the schema and every row — including the internal
+	// AUTOINCREMENT counters — but NOT the header fields, which a fresh database
+	// starts at zero. Carry them across explicitly. The values are integers this
+	// function just read out of the source, so formatting them into the statement
+	// is the only way PRAGMA takes them and carries no injection surface.
+	for i, p := range headerPragmas {
+		v := [2]int64{srcInv.userVersion, srcInv.applicationID}[i]
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA enc.%s = %d", p, v)); err != nil {
+			return inventory{}, fmt.Errorf("cek: carry %s onto the encrypted target: %w", p, err)
+		}
+	}
 	if _, err := conn.ExecContext(ctx, "DETACH DATABASE enc"); err != nil {
 		return inventory{}, fmt.Errorf("cek: detach the encrypted target: %w", err)
 	}
@@ -257,6 +278,12 @@ func verify(tmp string, key []byte, src inventory) error {
 		return fmt.Errorf("read what the encrypted copy holds: %w", err)
 	}
 
+	if dst.userVersion != src.userVersion {
+		return fmt.Errorf("user_version is %d in the source and %d in the copy", src.userVersion, dst.userVersion)
+	}
+	if dst.applicationID != src.applicationID {
+		return fmt.Errorf("application_id is %d in the source and %d in the copy", src.applicationID, dst.applicationID)
+	}
 	if dst.schema != src.schema {
 		return fmt.Errorf("the schemas differ")
 	}
@@ -279,11 +306,21 @@ func verify(tmp string, key []byte, src inventory) error {
 }
 
 // inventory is what a database holds, in the form two of them can be compared:
-// a schema hash, and per table a row count and a content hash.
+// the header fields an application sets, a schema hash, and per table a row
+// count and a content hash.
 type inventory struct {
-	schema [32]byte
-	tables map[string]tableStat
+	userVersion   int64
+	applicationID int64
+	schema        [32]byte
+	tables        map[string]tableStat
 }
+
+// headerPragmas are the values a database carries in its HEADER rather than in a
+// table: an application's own schema version and its file-format tag. A copy
+// does not inherit them — measured, not assumed (fidelity_test.go) — and losing
+// user_version silently is how a store comes back with a migration framework
+// convinced it is looking at version 0.
+var headerPragmas = []string{"user_version", "application_id"}
 
 type tableStat struct {
 	count   int64
@@ -291,6 +328,13 @@ type tableStat struct {
 }
 
 func readInventory(ctx context.Context, conn *sql.Conn) (inventory, error) {
+	var header [2]int64
+	for i, p := range headerPragmas {
+		if err := conn.QueryRowContext(ctx, "PRAGMA "+p).Scan(&header[i]); err != nil {
+			return inventory{}, fmt.Errorf("read %s: %w", p, err)
+		}
+	}
+
 	rows, err := conn.QueryContext(ctx,
 		`SELECT type,name,COALESCE(tbl_name,''),COALESCE(sql,'') FROM sqlite_master `+
 			`WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name`)
@@ -320,7 +364,11 @@ func readInventory(ctx context.Context, conn *sql.Conn) (inventory, error) {
 	for _, l := range schemaLines {
 		writeLP(h, []byte(l))
 	}
-	inv := inventory{tables: make(map[string]tableStat, len(tables))}
+	inv := inventory{
+		userVersion:   header[0],
+		applicationID: header[1],
+		tables:        make(map[string]tableStat, len(tables)),
+	}
 	copy(inv.schema[:], h.Sum(nil))
 
 	for _, tbl := range tables {
