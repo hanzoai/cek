@@ -20,7 +20,6 @@ import (
 // This builds a database holding every one of them, converts it, and compares
 // the two by asking the database itself.
 func TestAConversionCarriesEverythingNotJustRows(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	path := filepath.Join(t.TempDir(), "hostile.db")

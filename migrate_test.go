@@ -5,21 +5,12 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hanzoai/namespace"
 	sqlitedrv "github.com/hanzoai/sqlite"
 )
-
-// The conversion is a SQLCipher operation, so these run where the codec is.
-// Under the pure-Go backend there is no sqlcipher_export and Convert says so
-// rather than pretending; that is asserted by TestConvertSaysWhyItCannot.
-func requireCodec(t *testing.T) {
-	t.Helper()
-	if !sqlitedrv.EncryptionAvailable() || !sqlitedrv.CodecLinked() {
-		t.Skip("no SQLCipher codec linked in this build")
-	}
-}
 
 // seedPlaintext writes an ordinary, unencrypted SQLite database holding values
 // of every storage class — including the ones a careless copy loses: a NULL, an
@@ -118,7 +109,6 @@ func setTestMaster(t *testing.T) {
 // that was written in the clear ends up as ciphertext, opens under its derived
 // key, and still holds every row.
 func TestConvertEncryptsAnExistingPlaintextDatabase(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	path := filepath.Join(t.TempDir(), "iam.db")
@@ -177,7 +167,6 @@ func TestConvertEncryptsAnExistingPlaintextDatabase(t *testing.T) {
 // TestConvertIsIdempotent — a caller runs it on every boot, so the second run
 // has to be a no-op that keeps the data readable.
 func TestConvertIsIdempotent(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	path := filepath.Join(t.TempDir(), "iam.db")
@@ -216,7 +205,6 @@ func TestConvertIsIdempotent(t *testing.T) {
 // keyed, and keyed to THIS store: the same master with a different subsystem
 // derives a different key and must not open it.
 func TestConvertedStoreRefusesAnotherSubsystemsKey(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	path := filepath.Join(t.TempDir(), "iam.db")
@@ -275,7 +263,6 @@ func TestConvertWithoutAMasterRefuses(t *testing.T) {
 // the same file under the same key, so a store that names its own path is not a
 // second scheme.
 func TestOpenAtIsOpenAtTheNamespacePath(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	dir := t.TempDir()
@@ -315,7 +302,6 @@ func TestOpenAtIsOpenAtTheNamespacePath(t *testing.T) {
 // the plaintext aside and the rename that put the encrypted copy in place. The
 // derived key opens the copy, so the right move is to finish.
 func TestInterruptedSwapIsFinished(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	dir := t.TempDir()
@@ -415,7 +401,6 @@ func TestATruncatedStoreIsRefusedAndKeepsItsBackup(t *testing.T) {
 }
 
 func TestAStoreUnderAnotherMasterKeepsItsBackup(t *testing.T) {
-	requireCodec(t)
 	setTestMaster(t)
 
 	dir := t.TempDir()
@@ -452,5 +437,58 @@ func TestConvertDoesNotCreateAStoreThatIsNotThere(t *testing.T) {
 	}
 	if fileExists(path) {
 		t.Fatal("Convert created a store, which is how an empty identity service gets served")
+	}
+}
+
+// TestConvertRefusesAVirtualTable draws the boundary of a logical copy.
+//
+// A virtual table brings shadow tables SQLite maintains for it, holding an index
+// layout rather than rows. Recreating the virtual table regenerates them, so their
+// bytes need not match — and verify compares content per table, which would then
+// report a difference nothing in the data explains. Refusing names the reason
+// instead, and leaves the plaintext exactly where it was.
+func TestConvertRefusesAVirtualTable(t *testing.T) {
+	setTestMaster(t)
+
+	path := filepath.Join(t.TempDir(), "fts.db")
+	db, err := sql.Open("sqlite", sqlitedrv.DSN(path, nil))
+	if err != nil {
+		t.Fatalf("open plaintext: %v", err)
+	}
+	// Whichever module this build compiled in — the refusal is about virtual
+	// tables, not about any one of them.
+	made := ""
+	for ddl, seed := range map[string]string{
+		`CREATE VIRTUAL TABLE notes USING fts5(body)`:      `INSERT INTO notes(body) VALUES ('hello')`,
+		`CREATE VIRTUAL TABLE notes4 USING fts4(body)`:     `INSERT INTO notes4(body) VALUES ('hello')`,
+		`CREATE VIRTUAL TABLE boxes USING rtree(id,x0,x1)`: `INSERT INTO boxes VALUES (1,0.0,1.0)`,
+	} {
+		if _, err := db.Exec(ddl); err == nil {
+			if _, err := db.Exec(seed); err != nil {
+				_ = db.Close()
+				t.Fatalf("seed the virtual table: %v", err)
+			}
+			made = ddl
+			break
+		}
+	}
+	if made == "" {
+		_ = db.Close()
+		t.Skip("this build compiled in no virtual table module, so there is none to refuse")
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close the seed: %v", err)
+	}
+
+	err = Convert(namespace.System(), "iam", path)
+	if err == nil {
+		t.Fatal("Convert accepted a virtual table; a logical copy cannot promise its shadow tables")
+	}
+	if !strings.Contains(err.Error(), "virtual table") {
+		t.Fatalf("the refusal must name what it refused, got: %v", err)
+	}
+	// The original is untouched, which is the promise that makes refusing safe.
+	if !bytes.Equal(header(t, path), []byte(sqliteMagic)) {
+		t.Fatal("the plaintext original was not left as it was")
 	}
 }

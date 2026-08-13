@@ -242,8 +242,24 @@ func convert(path string, key []byte) error {
 }
 
 // export folds the source's WAL into its main file, records what it holds, and
-// copies every page into a fresh encrypted database at tmp with SQLCipher's own
-// sqlcipher_export. The source is only ever read.
+// copies every object and every row into a fresh encrypted database at tmp. The
+// source is only ever read.
+//
+// THE COPY IS LOGICAL AND IT RUNS IN GO, on two ordinary handles: the plaintext
+// source opened with no key, the encrypted target opened with one. It was
+// SQLCipher's sqlcipher_export, which is a SQL function only the C library
+// defines — so a build without that library could not convert a database at all,
+// and the store it was pointed at stayed unopenable. Nothing else here needed the
+// C engine: github.com/hanzoai/sqlite encrypts on every build (the pure-Go
+// SQLCipher codec envelope, byte-compatible with the C one), so the conversion
+// was the only place the dependency survived, and it did not have to.
+//
+// A byte-level encrypt of the source is not available for this: SQLCipher needs 80
+// reserved bytes per page for its IV and tag, an ordinary plaintext database
+// reserves none, and no pragma retrofits that into an existing file. A fresh keyed
+// database has the reserve from its first page, so the rows move logically — which
+// is what sqlcipher_export did too, and why verify compares content rather than
+// bytes.
 func export(path, tmp string, key []byte) (inventory, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), convertTimeout)
 	defer cancel()
@@ -253,7 +269,7 @@ func export(path, tmp string, key []byte) (inventory, error) {
 		return inventory{}, err
 	}
 	defer func() { _ = src.Close() }()
-	src.SetMaxOpenConns(1) // ATTACH and sqlcipher_export must meet on ONE connection
+	src.SetMaxOpenConns(1)
 
 	conn, err := src.Conn(ctx)
 	if err != nil {
@@ -279,35 +295,253 @@ func export(path, tmp string, key []byte) (inventory, error) {
 	if err != nil {
 		return inventory{}, fmt.Errorf("cek: read what %q holds: %w", path, err)
 	}
+	objs, err := schemaObjects(ctx, conn)
+	if err != nil {
+		return inventory{}, fmt.Errorf("cek: read the schema of %q: %w", path, err)
+	}
 
-	// BOTH the path and the key are bound, so neither reaches SQLite as text. The
-	// key especially: written into the statement, a parse error quotes the
-	// statement back — and SQLite's error would then carry the whole key into a
-	// log the moment a build turns off the double-quoted-string fallback that
-	// currently makes `KEY "x'...'"` parse at all.
-	if _, err := conn.ExecContext(ctx, `ATTACH DATABASE ? AS enc KEY ?`, tmp, hexKey(key)); err != nil {
-		return inventory{}, fmt.Errorf("cek: attach the encrypted target: %w", err)
+	dst, err := openKeyed(tmp, key)
+	if err != nil {
+		return inventory{}, err
 	}
-	if _, err := conn.ExecContext(ctx, "SELECT sqlcipher_export('enc')"); err != nil {
-		_, _ = conn.ExecContext(ctx, "DETACH DATABASE enc")
-		return inventory{}, fmt.Errorf("cek: copy %q into the encrypted target: %w", path, err)
+	dst.SetMaxOpenConns(1)
+	if err := copyInto(ctx, conn, dst, objs, srcInv); err != nil {
+		_ = dst.Close()
+		return inventory{}, err
 	}
-	// sqlcipher_export copies the schema and every row — including the internal
-	// AUTOINCREMENT counters — but NOT the header fields, which a fresh database
-	// starts at zero. Carry them across explicitly. The values are integers this
-	// function just read out of the source, so formatting them into the statement
-	// is the only way PRAGMA takes them and carries no injection surface.
-	for i, p := range headerPragmas {
-		v := [2]int64{srcInv.userVersion, srcInv.applicationID}[i]
-		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA enc.%s = %d", p, v)); err != nil {
-			return inventory{}, fmt.Errorf("cek: carry %s onto the encrypted target: %w", p, err)
-		}
-	}
-	if _, err := conn.ExecContext(ctx, "DETACH DATABASE enc"); err != nil {
-		return inventory{}, fmt.Errorf("cek: detach the encrypted target: %w", err)
+	// CLOSE IT HERE, not on a defer. The encrypted file is written when the last
+	// handle closes — that is what the envelope's seal is — and convert() reads
+	// the file straight after this returns, to classify it and to refuse a copy
+	// that still has a journal beside it.
+	if err := dst.Close(); err != nil {
+		return inventory{}, fmt.Errorf("cek: close the encrypted copy of %q: %w", path, err)
 	}
 	return srcInv, nil
 }
+
+// object is one row of sqlite_master worth recreating.
+type object struct{ typ, name, ddl string }
+
+// schemaObjects reads every object the copy has to recreate, in creation order.
+//
+// It REFUSES a virtual table. One brings shadow tables that SQLite maintains for
+// it, whose contents are an index layout rather than rows; recreating the virtual
+// table regenerates them, and no logical copy can promise the same bytes. The C
+// function did this from inside the engine. Nothing cek converts has one, and a
+// refusal names the reason rather than producing a database that verify would
+// reject for a difference it cannot explain.
+func schemaObjects(ctx context.Context, conn *sql.Conn) ([]object, error) {
+	rows, err := conn.QueryContext(ctx,
+		`SELECT type,name,COALESCE(sql,'') FROM sqlite_master `+
+			`WHERE name NOT LIKE 'sqlite_%' ORDER BY rowid`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []object
+	for rows.Next() {
+		var o object
+		if err := rows.Scan(&o.typ, &o.name, &o.ddl); err != nil {
+			return nil, err
+		}
+		if o.ddl == "" {
+			continue // an index SQLite made for a constraint; it comes back with the table
+		}
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(o.ddl)), "CREATE VIRTUAL TABLE") {
+			return nil, fmt.Errorf("cek: %q is a virtual table, whose shadow tables a logical copy cannot reproduce byte for byte", o.name)
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// copyInto creates the schema in the target, moves every row, and carries the two
+// header fields a fresh database starts at zero.
+//
+// TABLES FIRST, THEN ROWS, THEN EVERYTHING ELSE. An index built as the rows arrive
+// is built once per insert; a trigger present while they arrive would fire on them
+// and write rows the source never had. So both wait until the data is in.
+func copyInto(ctx context.Context, src *sql.Conn, dst *sql.DB, objs []object, inv inventory) error {
+	conn, err := dst.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("cek: take a connection to the encrypted copy: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// A foreign key can point at a table that has not been created yet, and the
+	// rows arrive table by table, so a row can reference one that is still empty.
+	// The source already satisfies its own constraints; re-checking them mid-copy
+	// only makes the order of the copy a correctness question.
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return fmt.Errorf("cek: hold off foreign keys on the copy: %w", err)
+	}
+
+	for _, o := range objs {
+		if o.typ != "table" {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, o.ddl); err != nil {
+			return fmt.Errorf("cek: create %q in the copy: %w", o.name, err)
+		}
+	}
+	for _, o := range objs {
+		if o.typ != "table" {
+			continue
+		}
+		if err := copyRows(ctx, src, conn, o.name); err != nil {
+			return fmt.Errorf("cek: copy the rows of %q: %w", o.name, err)
+		}
+	}
+	for _, o := range objs {
+		if o.typ == "table" {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, o.ddl); err != nil {
+			return fmt.Errorf("cek: create %s %q in the copy: %w", o.typ, o.name, err)
+		}
+	}
+
+	// AUTOINCREMENT counters live in sqlite_sequence, which SQLite creates with the
+	// first such table and fills from the rows it is given — so after a copy it
+	// holds the highest rowid COPIED, which is the same number, unless a table's
+	// top rows were deleted. Then the next insert would reuse an id the source had
+	// already handed out. The source's own counters settle it.
+	if err := copySequence(ctx, src, conn); err != nil {
+		return err
+	}
+
+	// The header fields sqlcipher_export did not carry either. Integers this
+	// process just read out of the source, and PRAGMA takes no parameters.
+	for i, p := range headerPragmas {
+		v := [2]int64{inv.userVersion, inv.applicationID}[i]
+		if _, err := conn.ExecContext(ctx, fmt.Sprintf("PRAGMA %s = %d", p, v)); err != nil {
+			return fmt.Errorf("cek: carry %s onto the copy: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// copyRows moves one table, naming its columns explicitly.
+//
+// SELECT * would also read a GENERATED column, which cannot be inserted into, and
+// would bind columns by position — so a table whose DDL SQLite normalised into a
+// different order would be copied into the wrong columns. table_xinfo reports the
+// generated ones (hidden 2 and 3) and it reports them in the target's order too,
+// since both sides created the table from the same DDL.
+func copyRows(ctx context.Context, src *sql.Conn, dst *sql.Conn, table string) error {
+	cols, err := userColumns(ctx, src, table)
+	if err != nil {
+		return err
+	}
+	if len(cols) == 0 {
+		return nil // every column is generated: there is nothing to write
+	}
+	quoted := make([]string, len(cols))
+	marks := make([]string, len(cols))
+	for i, c := range cols {
+		quoted[i] = quoteIdent(c)
+		marks[i] = "?"
+	}
+	list := strings.Join(quoted, ",")
+
+	rows, err := src.QueryContext(ctx, "SELECT "+list+" FROM "+quoteIdent(table))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+
+	ins := "INSERT INTO " + quoteIdent(table) + " (" + list + ") VALUES (" + strings.Join(marks, ",") + ")"
+	tx, err := dst.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	stmt, err := tx.PrepareContext(ctx, ins)
+	if err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	vals := make([]any, len(cols))
+	ptrs := make([]any, len(cols))
+	for i := range vals {
+		ptrs[i] = &vals[i]
+	}
+	for rows.Next() {
+		if err := rows.Scan(ptrs...); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+		if _, err := stmt.ExecContext(ctx, vals...); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
+// userColumns names the columns of table that hold stored values, in order.
+func userColumns(ctx context.Context, conn *sql.Conn, table string) ([]string, error) {
+	rows, err := conn.QueryContext(ctx, "SELECT name,hidden FROM pragma_table_xinfo(?)", table)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var name string
+		var hidden int
+		if err := rows.Scan(&name, &hidden); err != nil {
+			return nil, err
+		}
+		if hidden == 2 || hidden == 3 {
+			continue // VIRTUAL and STORED generated columns: computed, never written
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// copySequence carries the AUTOINCREMENT counters, for the tables that have one.
+func copySequence(ctx context.Context, src *sql.Conn, dst *sql.Conn) error {
+	var present int
+	if err := src.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'`).Scan(&present); err != nil {
+		return fmt.Errorf("cek: look for the sequence table: %w", err)
+	}
+	if present == 0 {
+		return nil
+	}
+	rows, err := src.QueryContext(ctx, "SELECT name,seq FROM sqlite_sequence")
+	if err != nil {
+		return fmt.Errorf("cek: read the sequence table: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name string
+		var seq int64
+		if err := rows.Scan(&name, &seq); err != nil {
+			return err
+		}
+		// The row exists already when the copy inserted into that table, and does
+		// not when it was empty — so REPLACE it rather than upsert: sqlite_sequence
+		// carries no primary key and no unique index, which is what makes an
+		// ON CONFLICT target invalid on it.
+		if _, err := dst.ExecContext(ctx, "DELETE FROM sqlite_sequence WHERE name = ?", name); err != nil {
+			return fmt.Errorf("cek: clear the sequence of %q: %w", name, err)
+		}
+		if _, err := dst.ExecContext(ctx,
+			"INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)", name, seq); err != nil {
+			return fmt.Errorf("cek: carry the sequence of %q: %w", name, err)
+		}
+	}
+	return rows.Err()
+}
+
+// quoteIdent renders an identifier for a statement, doubling any embedded quote.
+func quoteIdent(s string) string { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
 
 // verify re-opens the encrypted copy exactly as the application will and asserts
 // that it holds the same database: integrity_check ok, the same schema, and per

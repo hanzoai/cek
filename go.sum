@@ -6,6 +6,8 @@ github.com/google/uuid v1.6.1-0.20241114170450-2d3c2a9cc518 h1:UBg1xk+oAsIVbFuGg
 github.com/google/uuid v1.6.1-0.20241114170450-2d3c2a9cc518/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/hanzoai/csqlite v0.1.0 h1:suwC3dh0INlfP/U0Es6cDf6JNQ+2+GVLLATPWCUux6k=
 github.com/hanzoai/csqlite v0.1.0/go.mod h1:H31a/O6VXuklR9UBkgY++bmAK5uzVfXPqU0F6P9Wsos=
+github.com/hanzoai/csqlite v0.1.2 h1:4DzdgUfKADhzEP66Y30/HwepuBLrwt7NsemJMfrPGl4=
+github.com/hanzoai/csqlite v0.1.2/go.mod h1:H31a/O6VXuklR9UBkgY++bmAK5uzVfXPqU0F6P9Wsos=
 github.com/hanzoai/namespace v1.2.0 h1:FLEHzR/GyE/OltXozMvT2n2FfUUxTuVVbILKZBkEjLI=
 github.com/hanzoai/namespace v1.2.0/go.mod h1:vGuxMDHg5MdhH5q2bqqjZL/afINBWJubP4WD1YwZTm4=
 github.com/hanzoai/sqlcipher v0.1.1 h1:GARjSiUEa1lwhd1/f87XRaujZBG5s1ZwxrZW2Es/ADI=
@@ -14,6 +16,8 @@ github.com/hanzoai/sqlite v0.4.0 h1:xlF6w6xzn2VSeAVBKFrZfIq0ISqRSTHz2g3QN3eCcnE=
 github.com/hanzoai/sqlite v0.4.0/go.mod h1:sE5uvENQ+q+rI011AwFuAuJ7DwOoDnywyCQstZ0ekHQ=
 github.com/hanzoai/sqlite v0.5.0 h1:1YydiyNAvL+WcXC1lUqZsUDaR4/7YkVb+wZm9qq9DSc=
 github.com/hanzoai/sqlite v0.5.0/go.mod h1:7hlAtZspL0Ggx/j0cSo6npPFtUeikvIxnMDb7yTaJD0=
+github.com/hanzoai/sqlite v0.5.2 h1:hXHOwYi6vm2emrStqfIvahx8qUr6v2AFiyWOqsTtc8w=
+github.com/hanzoai/sqlite v0.5.2/go.mod h1:6MOvr13PLL+ajbg6SGf1nSvqDsCNzKIvwrLo429LFUY=
 github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/luxfi/crypto v1.20.2 h1:L81WEsU/hs2A76F5PWBusG0yU74QqkDdUqqgexWUxh4=
