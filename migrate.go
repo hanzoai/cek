@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"hash"
 	"math"
@@ -77,6 +78,7 @@ const (
 	tmpSuffix      = ".cek.tmp"   // in-progress encrypted target; same volume, so the rename is atomic
 	plainBakSuffix = ".plain.bak" // transient pre-migration plaintext, shredded after a verified open
 	lockSuffix     = ".cek.lock"  // per-database flock, so two processes cannot convert at once
+	keyIDSuffix    = ".keyid"     // which key sealed this database; see keyID
 
 	sqliteMagic = "SQLite format 3\x00" // the 16-byte header of an UNENCRYPTED database
 	headerLen   = 16
@@ -161,10 +163,56 @@ func settle(path string, key []byte) error {
 	// key surfaces at the first read and not before.
 	var n int64
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master").Scan(&n); err != nil {
-		return fmt.Errorf("cek: %q does not read under its key (wrong master key, or a damaged store): %w", path, err)
+		return fmt.Errorf("cek: %q does not read under its key (%s): %w", path, diagnose(path, key), err)
+	}
+	if err := recordKeyID(path, key); err != nil {
+		return fmt.Errorf("cek: %q opened but its key could not be recorded: %w", path, err)
 	}
 	shredPlainBak(path)
 	return nil
+}
+
+// keyID names the key a database was sealed under, so that a store which does
+// not open can say WHICH of the two things happened to it.
+//
+// "wrong master key, or a damaged store" was one sentence covering two faults
+// with opposite remedies: the first wants the right key and the bytes are
+// intact, the second wants a restore and the bytes are gone. Told apart only by
+// forensics — reading the file for a SQLite header that is not there, dating a
+// lock file, and finding no backup — while an identity store sat unreadable.
+// Recording the key's identity beside the database turns that into one
+// comparison.
+//
+// It is a COMMITMENT, not the key: SHA-256 over a domain-separating label and
+// the derived key, truncated. It cannot be run backwards to the key, it cannot
+// be replayed as one, and it says nothing about any other database — two stores
+// under one master have different derived keys and so different ids.
+func keyID(key []byte) string {
+	sum := sha256.Sum256(append([]byte("cek/keyid/v1\x00"), key...))
+	return hex.EncodeToString(sum[:8])
+}
+
+// recordKeyID writes the id beside the database, replacing any earlier one: the
+// key that opens it now is the fact worth keeping.
+func recordKeyID(path string, key []byte) error {
+	return os.WriteFile(path+keyIDSuffix, []byte(keyID(key)+"\n"), 0o600)
+}
+
+// diagnose answers the question the caller actually has when a store will not
+// read: is this the wrong key, or damage. An absent id cannot answer it, and
+// says so rather than guessing — every store sealed before this existed is in
+// that position, and inventing a verdict for them is how a restore gets aimed
+// at the wrong file.
+func diagnose(path string, key []byte) string {
+	recorded, err := os.ReadFile(path + keyIDSuffix)
+	if err != nil {
+		return "no key id recorded, so wrong-key and damage are indistinguishable here"
+	}
+	was, now := strings.TrimSpace(string(recorded)), keyID(key)
+	if was != now {
+		return fmt.Sprintf("SEALED UNDER A DIFFERENT KEY: sealed under %s, opened with %s — the bytes are intact and want the other key, not a restore", was, now)
+	}
+	return fmt.Sprintf("the key is the one that sealed it (%s), so the store itself is damaged", now)
 }
 
 // convert holds the whole of the one-way trip, with the lock already held and
@@ -229,15 +277,15 @@ func convert(path string, key []byte) error {
 	}
 	syncDir(filepath.Dir(path))
 
-	// Prove the real path opens under the real key before the plaintext goes.
-	db, err := openKeyed(path, key)
-	if err != nil {
-		return fmt.Errorf("cek: the converted %q does not open (its plaintext is beside it as %s): %w", path, plainBakSuffix, err)
+	// Prove the real path READS under the real key before the plaintext goes, and
+	// let settle be the one place that decides it. This used to open a handle,
+	// close it, and shred — but database/sql connects lazily, so an open that
+	// touches no page proves nothing, which is the same mistake in a different
+	// shape as trusting the header. settle reads the schema, records which key
+	// sealed the file, and only then releases the plaintext.
+	if err := settle(path, key); err != nil {
+		return fmt.Errorf("cek: the converted %q did not verify (its plaintext is beside it as %s): %w", path, plainBakSuffix, err)
 	}
-	if err := db.Close(); err != nil {
-		return fmt.Errorf("cek: close the converted %q: %w", path, err)
-	}
-	shredPlainBak(path)
 	return nil
 }
 

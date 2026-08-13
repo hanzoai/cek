@@ -94,16 +94,22 @@ func header(t *testing.T, path string) []byte {
 	return h[:]
 }
 
-func setTestMaster(t *testing.T) {
+func setTestMaster(t *testing.T) []byte {
 	t.Helper()
 	k := make([]byte, KeyLen)
 	for i := range k {
 		k[i] = byte(i + 1)
 	}
+	defer func() { testMasterKey = k }()
 	if err := SetMaster(k); err != nil {
 		t.Fatalf("SetMaster: %v", err)
 	}
+	return k
 }
+
+// testMasterKey is what setTestMaster last installed, so a test can derive the
+// same keys the code under test derives.
+var testMasterKey []byte
 
 // TestConvertEncryptsAnExistingPlaintextDatabase is the whole point: a database
 // that was written in the clear ends up as ciphertext, opens under its derived
@@ -490,5 +496,63 @@ func TestConvertRefusesAVirtualTable(t *testing.T) {
 	// The original is untouched, which is the promise that makes refusing safe.
 	if !bytes.Equal(header(t, path), []byte(sqliteMagic)) {
 		t.Fatal("the plaintext original was not left as it was")
+	}
+}
+
+// TestASealedStoreSaysWhichKeySealedIt is the test the identity-store loss asked
+// for. That store did not open, and the only sentence available was "wrong master
+// key, or a damaged store" — two faults with opposite remedies, one wanting the
+// other key with the bytes intact, the other wanting a restore. Telling them
+// apart took a forensic session. It should take a comparison.
+func TestASealedStoreSaysWhichKeySealedIt(t *testing.T) {
+	setTestMaster(t)
+
+	path := filepath.Join(t.TempDir(), "iam.db")
+	seedPlaintext(t, path)
+	if err := Convert(namespace.System(), "iam", path); err != nil {
+		t.Fatalf("Convert: %v", err)
+	}
+
+	recorded, err := os.ReadFile(path + keyIDSuffix)
+	if err != nil {
+		t.Fatalf("a sealed store recorded no key id: %v", err)
+	}
+	right, err := DeriveKey(testMasterKey, namespace.System(), "iam")
+	if err != nil {
+		t.Fatalf("DeriveKey: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(recorded)), keyID(right); got != want {
+		t.Fatalf("recorded key id %q, want %q", got, want)
+	}
+
+	// The id is a commitment, not the key: it must not BE the key, nor any
+	// prefix of it, or recording it beside the database would publish it.
+	if bytes.Contains(recorded, right[:8]) {
+		t.Fatal("the recorded key id contains the key itself")
+	}
+
+	// A store under another key: intact bytes, wrong key. The diagnosis must say
+	// so, because the remedy is the other key and NOT a restore.
+	wrong, err := DeriveKey(testMasterKey, namespace.System(), "billing")
+	if err != nil {
+		t.Fatalf("DeriveKey: %v", err)
+	}
+	if d := diagnose(path, wrong); !strings.Contains(d, "SEALED UNDER A DIFFERENT KEY") {
+		t.Fatalf("a store opened with the wrong key diagnosed as %q", d)
+	}
+
+	// The same key that sealed it: whatever is wrong, it is not the key, so the
+	// store itself is damaged and a restore IS the remedy.
+	if d := diagnose(path, right); !strings.Contains(d, "damaged") {
+		t.Fatalf("a store opened with its own key diagnosed as %q", d)
+	}
+
+	// A store sealed before ids existed cannot answer, and must say that rather
+	// than invent a verdict — a guess here aims a restore at the wrong file.
+	if err := os.Remove(path + keyIDSuffix); err != nil {
+		t.Fatalf("remove key id: %v", err)
+	}
+	if d := diagnose(path, right); !strings.Contains(d, "indistinguishable") {
+		t.Fatalf("a store with no recorded id diagnosed as %q", d)
 	}
 }
