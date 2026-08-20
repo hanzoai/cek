@@ -4,8 +4,10 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hanzoai/namespace"
@@ -218,5 +220,47 @@ func TestTheWrongMasterDoesNotOpenAWrappedDEKDatabase(t *testing.T) {
 	}
 	if _, err := Open(ns, "kms", dir); err == nil {
 		t.Fatal("a wrapped-DEK database opened under the wrong master key")
+	}
+}
+
+// A sidecar sealed for one identity and opened under another is the failure that
+// looks least like itself: the master is right and the file is intact, so every
+// message about keys and corruption points away from the cause. The error has to
+// name the identity it derived, because that name is the whole diagnosis.
+//
+// It reads the sidecar and nothing else — no database is opened — because the
+// identity is settled before a page is ever decrypted.
+func TestAnIdentityMismatchNamesTheIdentityItDerived(t *testing.T) {
+	master := mk(15)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kms.db")
+	ns := mustNS(t, "hanzo", "")
+
+	fileID := make([]byte, fileIDLen)
+	if _, err := rand.Read(fileID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Seal a key for an identity this namespace does NOT derive.
+	stored := "someone-else/" + hex.EncodeToString(fileID)
+	kek, err := wrapKey(master, principalOrg, stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapped := wrapForTest(t, kek, mk(16), principalInfo(principalOrg, stored))
+	if err := os.WriteFile(path+sidecarSuffix, append(append([]byte{}, fileID...), wrapped...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = sidecarKey(master, ns, path)
+	if err == nil {
+		t.Fatal("a sidecar sealed for another identity opened anyway")
+	}
+	_, derived := wrapIdentity(ns, fileID)
+	if !strings.Contains(err.Error(), derived) {
+		t.Fatalf("the error does not name the identity it derived (%q):\n  %v", derived, err)
+	}
+	if strings.Contains(err.Error(), stored) {
+		t.Fatalf("the error names an identity this open never derived:\n  %v", err)
 	}
 }

@@ -94,7 +94,17 @@ func sidecarKey(master []byte, ns namespace.Namespace, path string) ([]byte, err
 	}
 	defer zero(kek)
 
-	return unwrapDEK(kek, wrapped, principalInfo(ptype, id))
+	dek, err := unwrapDEK(kek, wrapped, principalInfo(ptype, id))
+	if err != nil {
+		// SAY WHICH IDENTITY. The wrapping key is HKDF over the master AND the
+		// principal, so three different things make this fail and only one of them
+		// is the master. Naming the identity this open derived is what separates
+		// them: compare it with the identity that sealed the file and a mismatch
+		// is visible, where "wrong key or damaged sidecar" sends the reader to
+		// hunt for a lost master that was never lost.
+		return nil, fmt.Errorf("cek: the key beside this database does not open under %s %q — the master, the identity, or the sidecar itself differs from the one that sealed it: %w", ptype, id, err)
+	}
+	return dek, nil
 }
 
 // wrapIdentity is the identity a sidecar's wrapping key was derived under: the
@@ -142,8 +152,9 @@ func wrapKey(master []byte, ptype, id string) ([]byte, error) {
 // unwrapDEK opens a wrapped DEK — version(1) || nonce(12) || ciphertext||tag,
 // AES-256-GCM — with the version byte leading the additional data.
 //
-// A failure here is "the key is not here": a different master, or a damaged
-// sidecar. GCM authenticates before it returns anything, so there is no partial
+// A failure here is "this key does not open this envelope", and that is all it
+// is: the caller holds the identity the key was derived under and says which one
+// it tried. GCM authenticates before it returns anything, so there is no partial
 // key to hand back.
 func unwrapDEK(kek, blob, aad []byte) ([]byte, error) {
 	block, err := aes.NewCipher(kek)
@@ -163,7 +174,7 @@ func unwrapDEK(kek, blob, aad []byte) ([]byte, error) {
 	}
 	dek, err := gcm.Open(nil, blob[1:1+ns], blob[1+ns:], append([]byte{wrapVersion}, aad...))
 	if err != nil {
-		return nil, fmt.Errorf("cek: unwrap the key beside this database (wrong master key or damaged sidecar): %w", err)
+		return nil, fmt.Errorf("cek: the wrapped key does not authenticate: %w", err)
 	}
 	if len(dek) != dekLen {
 		return nil, fmt.Errorf("cek: unwrapped key is %d bytes, not %d", len(dek), dekLen)
