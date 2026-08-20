@@ -2,6 +2,7 @@ package cek
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -59,6 +60,67 @@ func TestDeriveSeparatesEveryAxis(t *testing.T) {
 			}
 			if bytes.Equal(base, got) {
 				t.Fatalf("%s produced the SAME key — two databases would share it", tc.name)
+			}
+		})
+	}
+}
+
+// The key itself, pinned as literal bytes.
+//
+// Separating every axis says only that these keys differ from each other. It
+// holds just as well for a derivation that has moved, and a derivation that has
+// moved is every database of that scheme unopenable. So the bytes are stated,
+// and stated for the namespace as it RENDERS: the rendering is part of the
+// input, so a drift there would move the key just as surely as a change here.
+//
+// The values come from an implementation of the scheme written separately from
+// this one, in another language — the same reference that reproduces the sidecar
+// vectors in sidecar_golden_test.go.
+func TestTheDerivedKey(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ns        namespace.Namespace
+		renders   string
+		subsystem string
+		key       string
+	}{
+		{
+			name: "an org", ns: namespace.MustOrg("acme"), renders: "org/acme",
+			subsystem: "treasury",
+			key:       "668a1f0dde67c9136c17731f0280a04aaf316ee5566e61e1d91fb2f586d50e54",
+		},
+		{
+			name: "a project of that org", ns: namespace.MustOrgProject("acme", "web"), renders: "org/acme/web",
+			subsystem: "treasury",
+			key:       "470113df9f803d2fe4f42427eaff8acdb00b6f8c1a21ac19e00d826e5394ab11",
+		},
+		{
+			name: "the platform", ns: namespace.System(), renders: "system",
+			subsystem: "iam",
+			key:       "eb8305eb852bca0abf892d266e581b970d2eb26b3be0508ee57683c9d64ec9e0",
+		},
+		{
+			name: "the platform, another subsystem", ns: namespace.System(), renders: "system",
+			subsystem: "treasury",
+			key:       "1ef752ea2e5ff0b2ef49d19405f0ebe31e874d8540c2ccdf4ba70fce8211b8ba",
+		},
+		{
+			name: "an org id carrying the shape a folded name gets",
+			ns:   namespace.MustOrg("acme-0123456789abcdef"), renders: "org/acme-0123456789abcdef",
+			subsystem: "treasury",
+			key:       "6660d61a4c4d41ef562a7e6565aa4a6d466767aca5a63786489ac0f945351165",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.ns.String(); got != tc.renders {
+				t.Fatalf("the namespace renders as %q, want %q — the key is derived from this", got, tc.renders)
+			}
+			key, err := DeriveKey(goldenMaster(), tc.ns, tc.subsystem)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hex.EncodeToString(key); got != tc.key {
+				t.Fatalf("the derived key drifted from the one every database of this scheme was written under:\n got %s\nwant %s", got, tc.key)
 			}
 		})
 	}
