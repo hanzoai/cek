@@ -1,6 +1,6 @@
 module github.com/hanzoai/cek
 
-go 1.26.5
+go 1.26.8
 
 require (
 	github.com/hanzoai/namespace v1.2.0
