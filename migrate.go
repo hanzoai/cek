@@ -221,7 +221,7 @@ func convert(path string, key []byte) error {
 	tmp := path + tmpSuffix
 	removeDBFiles(tmp) // a previous attempt that did not commit
 
-	srcInv, err := export(path, tmp, key)
+	srcInv, err := export(path, tmp, nil, key)
 	if err != nil {
 		removeDBFiles(tmp)
 		return err
@@ -308,11 +308,20 @@ func convert(path string, key []byte) error {
 // database has the reserve from its first page, so the rows move logically — which
 // is what sqlcipher_export did too, and why verify compares content rather than
 // bytes.
-func export(path, tmp string, key []byte) (inventory, error) {
+//
+// srcKey is the key the source is read under: nil for a plaintext source, a
+// sidecar's DEK for a database Rekey moves to its derived key (rekey.go).
+func export(path, tmp string, srcKey, key []byte) (inventory, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), convertTimeout)
 	defer cancel()
 
-	src, err := openPlain(path)
+	var src *sql.DB
+	var err error
+	if srcKey == nil {
+		src, err = openPlain(path)
+	} else {
+		src, err = openKeyed(path, srcKey)
+	}
 	if err != nil {
 		return inventory{}, err
 	}

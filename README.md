@@ -15,6 +15,12 @@ maintain. A database is born encrypted or it does not exist.
 Losing the master loses the data. That is the property you want from encryption
 at rest, and the reason the master lives in KMS.
 
+Two kinds of file predate that and are moved onto it in place, each verified row
+for row before the original goes: `cek.Convert` encrypts a database written in the
+clear, and `cek.Rekey` moves one written under a random key held in a `.dek`
+sidecar beside it, which no copy of the database alone can open, to its derived
+key. Both are idempotent, so a caller runs them before an open.
+
 ## Where it sits
 
 | | |
